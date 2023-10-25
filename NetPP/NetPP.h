@@ -16,6 +16,7 @@
 #define NETPP_CONNECTION_RESET -1
 #define DEFAULT_CLIENT_REQUEST_MAGIC 0x4545
 #define DEFAULT_SERVER_RESPONSE_MAGIC 0x6969
+#define NETPP_DEFAULT_SERVER_PORT 9909
 
 bool CheckWsa()
 {
@@ -44,129 +45,6 @@ struct ServerFindResponse
     unsigned short Magic = DEFAULT_SERVER_RESPONSE_MAGIC;
 };
 
-// if TimeToSearch is 0 will loop indefinetly
-void SearchLAN(const unsigned short Port, const SIZE_T SizeofPacketToRecv, char* PacketToSend, SIZE_T SizeOfPacketToSend, const long TimeToSearch, std::function<void(sockaddr_in*, char*, int)> const& PacketRecvCb)
-{
-    if (!CheckWsa())
-    {
-        WSADATA WsaDat;
-        int ErrCode = WSAStartup(MAKEWORD(2, 2), &WsaDat);
-
-        if (ErrCode != 0)
-        {
-            std::cout << "WsaStartup failed: " + ErrCode << std::endl;
-        }
-    }
-
-
-    SOCKET ClientSock = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in ClientAddr;
-    ClientAddr.sin_family = AF_INET;
-    ClientAddr.sin_port = htons(Port);
-    ClientAddr.sin_addr.s_addr = INADDR_BROADCAST;
-
-    bool EnableSockOpt = true;
-    setsockopt(ClientSock, SOL_SOCKET, SO_BROADCAST, (char*)&EnableSockOpt, sizeof(bool));
-
-
-    sendto(ClientSock, PacketToSend, SizeOfPacketToSend, 0, (sockaddr*)&ClientAddr, sizeof(ClientAddr));
-
-    fd_set readSet;
-    struct timeval Timeout;
-    Timeout.tv_sec = TimeToSearch;
-    Timeout.tv_usec = 0;
-
-    DWORD Start = GetTickCount64();
-
-    char* Info = nullptr;
-    Info = new char[SizeofPacketToRecv];
-
-    while (true)
-    {
-        FD_ZERO(&readSet);
-        FD_SET(ClientSock, &readSet);
-
-        if (select(0, &readSet, NULL, NULL, &Timeout) > 0 && Info != nullptr) // Data available
-        {
-            sockaddr_in ServerAddr;
-
-            int Sz = sizeof(ServerAddr);
-            RtlZeroMemory(Info, SizeofPacketToRecv);
-
-            int RecvBytes = recvfrom(ClientSock, Info, SizeofPacketToRecv, 0, (sockaddr*)&ServerAddr, &Sz);
-
-            if (RecvBytes != SOCKET_ERROR)
-            {
-                PacketRecvCb(&ServerAddr, Info, SizeofPacketToRecv);
-            }
-            else
-            {
-                std::cout << "Error Receiving packet: " << WSAGetLastError() << std::endl;
-            }
-        }
-
-        if ((GetTickCount64() - Start > TimeToSearch * 1000) && TimeToSearch != 0)
-            break;
-    }
-
-    if (Info != nullptr)
-        delete[] Info;
-
-    closesocket(ClientSock);
-}
-
-// Meant to run on seperate thread
-void BroadCastServer(const unsigned short Port, const SIZE_T SizeOfServerFindPacket, std::function<void(SOCKET&, sockaddr_in*, char*, int)> const& PacketRecvCb)
-{
-    if (!CheckWsa())
-    {
-        WSADATA WsaDat;
-        int ErrCode = WSAStartup(MAKEWORD(2, 2), &WsaDat);
-
-        if (ErrCode != 0)
-        {
-            std::cout << "WsaStartup failed: " + ErrCode << std::endl;
-        }
-    }
-
-    SOCKET ServerSock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (ServerSock == INVALID_SOCKET)
-    {
-        std::cout << "Failed to create socket " << std::to_string(WSAGetLastError()) << std::endl;
-        return;
-    }
-
-    sockaddr_in ServerListen;
-    ServerListen.sin_family = AF_INET;
-    ServerListen.sin_port = htons(Port);
-    ServerListen.sin_addr.s_addr = INADDR_ANY;
-
-    int RetCode = bind(ServerSock, (sockaddr*)&ServerListen, sizeof(ServerListen));
-
-    if (RetCode != 0)
-    {
-        std::cout << "Failed to bind to socket " << std::to_string(WSAGetLastError()) << std::endl;
-        return;
-    }
-
-    while (!GetAsyncKeyState(VK_ESCAPE))
-    {
-        char* Buffer = new char[SizeOfServerFindPacket];
-        sockaddr_in ClientAddr;
-        int Sz = sizeof(ClientAddr);
-
-        int RecvBytes = recvfrom(ServerSock, Buffer, SizeOfServerFindPacket, 0, (sockaddr*)&ClientAddr, &Sz);
-
-        if (RecvBytes != SOCKET_ERROR)
-        {
-            PacketRecvCb(ServerSock, &ClientAddr, Buffer, RecvBytes);
-        }
-    }
-
-    closesocket(ServerSock);
-}
-
 struct ClientInfo
 {
     std::string IpV4 = "";
@@ -176,11 +54,16 @@ struct ClientInfo
 
 class NetPP
 {
-    bool IsServer = false;
     std::thread Listener;
-    bool ExitListener = false;
+    std::thread Broadcast;
     SOCKET ListenSocket = INVALID_SOCKET;
-    int Port = 9909;
+    int Port = NETPP_DEFAULT_SERVER_PORT;
+
+    bool IsServer = false;
+    bool ExitListener = false;
+    bool HasBeenInstantiated = false;
+    bool IsListening = false;
+    bool IsBroadcasting = false;
 
     void ListenerThread()
     {
@@ -258,16 +141,8 @@ class NetPP
         }
     }
 
-    public:
-    std::vector<ClientInfo> ConnectedClients = {};
-    SOCKET ClientSocket = INVALID_SOCKET;
-
-    NetPP(bool IsServer, bool StartListener, int Port, std::string IPV4 = "")
+    void BroadCastThread(const unsigned short Port, const SIZE_T SizeOfServerFindPacket, std::function<void(SOCKET&, sockaddr_in*, char*, int)> const& PacketRecvCb)
     {
-        this->Port = Port;
-        // Initialize DLL for use and checl if version is available
-        this->IsServer = IsServer;
-
         if (!CheckWsa())
         {
             WSADATA WsaDat;
@@ -279,45 +154,219 @@ class NetPP
             }
         }
 
-        if (this->IsServer)
+        SOCKET ServerSock = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (ServerSock == INVALID_SOCKET)
         {
-            if (StartListener)
-            {
-                std::cout << "starting listener from class" << std::endl;
-                Listener = std::thread(&NetPP::ListenerThread, this);
-            }
+            std::cout << "Failed to create socket " << std::to_string(WSAGetLastError()) << std::endl;
+            return;
         }
-        else
+
+        sockaddr_in ServerListen;
+        ServerListen.sin_family = AF_INET;
+        ServerListen.sin_port = htons(Port);
+        ServerListen.sin_addr.s_addr = INADDR_ANY;
+
+        int RetCode = bind(ServerSock, (sockaddr*)&ServerListen, sizeof(ServerListen));
+
+        if (RetCode != 0)
         {
-            std::cout << "Connecting to server" << std::endl;
-            // Create a SOCKET for connecting to server
+            std::cout << "Failed to bind to socket " << std::to_string(WSAGetLastError()) << std::endl;
+            return;
+        }
 
-            this->ClientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        this->IsBroadcasting = true;
 
-            if (ClientSocket == INVALID_SOCKET)
-            {
-                printf("socket create failed with error: %ld\n", WSAGetLastError());
-                WSACleanup();
-                return;
-            }
+        std::cout << "[NETPP] Broadcasting on port: " << Port << std::endl;
 
+        while (true)
+        {
+            char* Buffer = new char[SizeOfServerFindPacket];
             sockaddr_in ClientAddr;
+            int Sz = sizeof(ClientAddr);
 
-            memset(&ClientAddr, 0, sizeof(ClientAddr));
-            ClientAddr.sin_family = AF_INET;
-            ClientAddr.sin_addr.s_addr = inet_addr(IPV4.c_str());
-            ClientAddr.sin_port = htons(this->Port);
+            int RecvBytes = recvfrom(ServerSock, Buffer, SizeOfServerFindPacket, 0, (sockaddr*)&ClientAddr, &Sz);
 
-            // Connect to server.
-            int ErrCode = connect(ClientSocket, (sockaddr*)&ClientAddr, (int)sizeof(ClientAddr));
-            if (ErrCode == SOCKET_ERROR)
+            if (RecvBytes != SOCKET_ERROR)
             {
-                printf("connect failed with error: %ld\n", WSAGetLastError());
-                closesocket(ClientSocket);
-                ClientSocket = INVALID_SOCKET;
-                return;
+                PacketRecvCb(ServerSock, &ClientAddr, Buffer, RecvBytes);
             }
         }
+
+        closesocket(ServerSock);
+
+        this->IsBroadcasting = false;
+    }
+
+    public:
+    std::vector<ClientInfo> ConnectedClients = {};
+    SOCKET ClientSocket = INVALID_SOCKET;
+
+    NetPP()
+    {
+        if (this->HasBeenInstantiated)
+        {
+            return;
+        }
+
+        std::vector<ClientInfo> ConnectedClients = {};
+        SOCKET ClientSocket = INVALID_SOCKET;
+
+        bool IsServer = false;
+        bool ExitListener = false;
+        SOCKET ListenSocket = INVALID_SOCKET;
+        int Port = NETPP_DEFAULT_SERVER_PORT;
+        bool HasBeenInstantiated = false;
+        bool IsListening = false;
+    }
+
+    // if TimeToSearch is 0 will loop indefinetly
+    void SearchLAN(const unsigned short Port, const SIZE_T SizeofPacketToRecv, char* PacketToSend, SIZE_T SizeOfPacketToSend, const long TimeToSearch, std::function<void(sockaddr_in*, char*, int)> const& PacketRecvCb)
+    {
+        if (!CheckWsa())
+        {
+            WSADATA WsaDat;
+            int ErrCode = WSAStartup(MAKEWORD(2, 2), &WsaDat);
+
+            if (ErrCode != 0)
+            {
+                std::cout << "WsaStartup failed: " + ErrCode << std::endl;
+            }
+        }
+
+
+        SOCKET ClientSock = socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in ClientAddr;
+        ClientAddr.sin_family = AF_INET;
+        ClientAddr.sin_port = htons(Port);
+        ClientAddr.sin_addr.s_addr = INADDR_BROADCAST;
+
+        bool EnableSockOpt = true;
+        setsockopt(ClientSock, SOL_SOCKET, SO_BROADCAST, (char*)&EnableSockOpt, sizeof(bool));
+
+
+        sendto(ClientSock, PacketToSend, SizeOfPacketToSend, 0, (sockaddr*)&ClientAddr, sizeof(ClientAddr));
+
+        fd_set readSet;
+        struct timeval Timeout;
+        Timeout.tv_sec = 1;
+        Timeout.tv_usec = 0;
+
+        DWORD Start = GetTickCount64();
+
+        char* Info = nullptr;
+        Info = new char[SizeofPacketToRecv];
+
+        while (true)
+        {
+            FD_ZERO(&readSet);
+            FD_SET(ClientSock, &readSet);
+
+            if (select(0, &readSet, NULL, NULL, &Timeout) > 0 && Info != nullptr) // Data available
+            {
+                sockaddr_in ServerAddr;
+
+                int Sz = sizeof(ServerAddr);
+                RtlZeroMemory(Info, SizeofPacketToRecv);
+
+                int RecvBytes = recvfrom(ClientSock, Info, SizeofPacketToRecv, 0, (sockaddr*)&ServerAddr, &Sz);
+
+                if (RecvBytes != SOCKET_ERROR)
+                {
+                    PacketRecvCb(&ServerAddr, Info, SizeofPacketToRecv);
+                }
+                else
+                {
+                    std::cout << "Error Receiving packet: " << WSAGetLastError() << std::endl;
+                }
+            }
+
+            if ((GetTickCount64() - Start > TimeToSearch * 1000) && TimeToSearch != 0)
+                break;
+        }
+
+        if (Info != nullptr)
+            delete[] Info;
+
+        closesocket(ClientSock);
+    }
+
+    // Meant to run on seperate thread
+    void BroadCastServer(const unsigned short Port, const SIZE_T SizeOfServerFindPacket, std::function<void(SOCKET&, sockaddr_in*, char*, int)> const& PacketRecvCb)
+    {
+        Broadcast = std::thread(&NetPP::BroadCastThread, this, Port, SizeOfServerFindPacket, PacketRecvCb);
+    }
+
+    void CreateClient(unsigned short Port, std::string IP)
+    {
+        if (!CheckWsa())
+        {
+            WSADATA WsaDat;
+            int ErrCode = WSAStartup(MAKEWORD(2, 2), &WsaDat);
+
+            if (ErrCode != 0)
+            {
+                std::cout << "WsaStartup failed: " + ErrCode << std::endl;
+            }
+        }
+
+        std::cout << "Connecting to server" << std::endl;
+        // Create a SOCKET for connecting to server
+
+        this->ClientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+        if (ClientSocket == INVALID_SOCKET)
+        {
+            printf("socket create failed with error: %ld\n", WSAGetLastError());
+            WSACleanup();
+            return;
+        }
+
+        sockaddr_in ClientAddr;
+
+        memset(&ClientAddr, 0, sizeof(ClientAddr));
+        ClientAddr.sin_family = AF_INET;
+        ClientAddr.sin_addr.s_addr = inet_addr(IP.c_str());
+        ClientAddr.sin_port = htons(this->Port);
+
+        // Connect to server.
+        int ErrCode = connect(this->ClientSocket, (sockaddr*)&ClientAddr, (int)sizeof(ClientAddr));
+        if (ErrCode == SOCKET_ERROR)
+        {
+            printf("connect failed with error: %ld\n", WSAGetLastError());
+            closesocket(ClientSocket);
+            this->ClientSocket = INVALID_SOCKET;
+            return;
+        }
+
+        this->HasBeenInstantiated = true;
+        this->IsServer = false;
+    }
+
+    void CreateServer(bool StartListener, int Port)
+    {
+        if (!CheckWsa())
+        {
+            WSADATA WsaDat;
+            int ErrCode = WSAStartup(MAKEWORD(2, 2), &WsaDat);
+
+            if (ErrCode != 0)
+            {
+                std::cout << "WsaStartup failed: " + ErrCode << std::endl;
+            }
+        }
+
+        this->Port = Port;
+        // Initialize DLL for use and checl if version is available
+        this->IsServer = true;
+
+        if (StartListener)
+        {
+            std::cout << "starting listener from class" << std::endl;
+            this->Listener = std::thread(&NetPP::ListenerThread, this);
+        }
+
+        this->HasBeenInstantiated = true;
     }
 
     void StartListening()
@@ -325,15 +374,23 @@ class NetPP
         if (this->IsServer)
         {
             Listener = std::thread(&NetPP::ListenerThread, this);
+            this->IsListening = true;
         }
     }
 
     void StopListening()
     {
-        this->ExitListener = true;
-        closesocket(this->ListenSocket);
-        this->Listener.join();
-        this->ExitListener = false;
+        if (this->IsListening)
+        {
+            this->ExitListener = true;
+            closesocket(this->ListenSocket);
+            this->Listener.join();
+            this->ExitListener = false;
+        }
+        else
+        {
+            return;
+        }
     }
 
     int RecvFromClient(SOCKET Target, void* Buffer, int Len)
@@ -362,7 +419,9 @@ class NetPP
         }
         else
         {
-            closesocket(this->ClientSocket);
+            if (this->ClientSocket != INVALID_SOCKET)
+                closesocket(this->ClientSocket);
+
             WSACleanup();
         }
     }
