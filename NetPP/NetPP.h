@@ -65,6 +65,8 @@ class NetPP
     bool IsListening = false;
     bool IsBroadcasting = false;
 
+    void(*AcceptCb)(sockaddr_in*, SOCKET&) = nullptr;
+
     void ListenerThread()
     {
         if (!CheckWsa())
@@ -117,7 +119,14 @@ class NetPP
             int len = sizeof(ClientAddrInfo);
             memset(&ClientAddrInfo, 0, sizeof(ClientAddrInfo));
 
-            SOCKET Client = accept(ListenSocket, (sockaddr*)&ClientAddrInfo, &len);
+            SOCKET Client = INVALID_SOCKET;
+
+            Client = accept(ListenSocket, (sockaddr*)&ClientAddrInfo, &len);
+
+            if(this->AcceptCb != nullptr)
+            {
+                this->AcceptCb(&ClientAddrInfo, Client);
+            }
 
             if (Client == INVALID_SOCKET)
             {
@@ -311,7 +320,7 @@ class NetPP
         }
 
         std::cout << "Connecting to server" << std::endl;
-        // Create a SOCKET for connecting to server
+        // Create a SOCKET for cconnecting to server
 
         this->ClientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -343,7 +352,7 @@ class NetPP
         this->IsServer = false;
     }
 
-    void CreateServer(bool StartListener, int Port)
+    void CreateServer(bool StartListener, int Port, void (*PostAccecptCb)(sockaddr_in*, SOCKET&) = nullptr)
     {
         if (!CheckWsa())
         {
@@ -353,12 +362,14 @@ class NetPP
             if (ErrCode != 0)
             {
                 std::cout << "WsaStartup failed: " + ErrCode << std::endl;
+                return;
             }
         }
 
         this->Port = Port;
         // Initialize DLL for use and checl if version is available
         this->IsServer = true;
+        this->AcceptCb = PostAccecptCb;
 
         if (StartListener)
         {
@@ -393,11 +404,54 @@ class NetPP
         }
     }
 
-    int RecvFromClient(SOCKET Target, void* Buffer, int Len)
+    int RecvClient(SOCKET Target, void* Buffer, int Len)
     {
         int RetCode = recv(Target, (char*)Buffer, Len, 0);
 
         return RetCode;
+    }
+
+    int RecvTimeout(SOCKET Target, void* Buffer, SIZE_T Len, long TimeoutMilliSecs)
+    {
+        fd_set readSet;
+        struct timeval Timeout;
+
+        Timeout.tv_sec = 0;
+        Timeout.tv_usec = 50;
+
+        DWORD Start = GetTickCount64();
+        while (true)
+        {
+            FD_ZERO(&readSet);
+            FD_SET(Target, &readSet);
+
+            int RecvBytes = 0;
+
+            if (select(0, &readSet, NULL, NULL, &Timeout) > 0 && Buffer != nullptr) // Data available
+            {
+                sockaddr_in ServerAddr;
+
+                int Sz = sizeof(ServerAddr);
+                RtlZeroMemory(Buffer, Len);
+
+                RecvBytes = recvfrom(Target, (char*)Buffer, Len, 0, (sockaddr*)&ServerAddr, &Sz);
+
+                if (RecvBytes != SOCKET_ERROR)
+                {
+                    return RecvBytes;
+                }
+                else
+                {
+                    std::cout << "Error recieving: " << GetLastError() << " WSA: " << WSAGetLastError() << std::endl;
+                    return RecvBytes;
+                }
+            }
+
+            if ((GetTickCount64() - Start > TimeoutMilliSecs) || TimeoutMilliSecs == 0)
+                break;
+        }
+
+        return SOCKET_ERROR;
     }
 
     int SendToClient(SOCKET Target, void* Buffer, int Len)
